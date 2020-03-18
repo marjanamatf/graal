@@ -38,11 +38,13 @@ import org.graalvm.compiler.debug.DebugContext;
 import org.graalvm.compiler.debug.DebugHandlersFactory;
 import org.graalvm.compiler.graph.Node;
 import org.graalvm.compiler.java.BytecodeParser;
+import org.graalvm.compiler.java.GraphBuilderPhase;
 import org.graalvm.compiler.nodes.*;
 import org.graalvm.compiler.nodes.cfg.ControlFlowGraph;
 import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderContext;
 import org.graalvm.compiler.nodes.graphbuilderconf.InlineInvokePlugin;
+import org.graalvm.compiler.nodes.graphbuilderconf.IntrinsicContext;
 import org.graalvm.compiler.nodes.java.LoadFieldNode;
 import org.graalvm.compiler.nodes.java.StoreFieldNode;
 import org.graalvm.compiler.options.Option;
@@ -122,6 +124,13 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
     @Override
     public void notifyNotInlined(GraphBuilderContext b, ResolvedJavaMethod method, Invoke invoke) {
 
+    }
+
+    class MethodBytecodeParser extends BytecodeParser{
+
+        protected MethodBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
+            super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext);
+        }
     }
 }
 
