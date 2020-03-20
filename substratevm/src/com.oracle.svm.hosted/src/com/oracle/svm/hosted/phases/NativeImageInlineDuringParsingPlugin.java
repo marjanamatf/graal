@@ -29,6 +29,11 @@ import com.oracle.graal.pointsto.infrastructure.GraphProvider;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.graal.pointsto.util.CompletionExecutor.DebugContextRunnable;
+import com.oracle.svm.core.SubstrateOptions;
+import com.oracle.svm.core.annotate.NeverInline;
+import com.oracle.svm.core.annotate.NeverInlineTrivial;
+import com.oracle.svm.core.annotate.RestrictHeapAccess;
+import com.oracle.svm.core.annotate.Uninterruptible;
 import com.oracle.svm.core.option.HostedOptionKey;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.meta.HostedMethod;
@@ -49,6 +54,7 @@ import org.graalvm.compiler.nodes.java.LoadFieldNode;
 import org.graalvm.compiler.nodes.java.StoreFieldNode;
 import org.graalvm.compiler.options.Option;
 import org.graalvm.compiler.options.OptionValues;
+import org.graalvm.compiler.phases.OptimisticOptimizations;
 
 import java.util.HashMap;
 import java.util.List;
@@ -60,10 +66,10 @@ import static com.oracle.graal.pointsto.infrastructure.GraphProvider.*;
 
 public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin {
 
-    // to use this plugin: native-image Example -H:+NativeInlineBeforeAnalysis
+    // to use this plugin: native-image Example -H:+InlineBeforeAnalysis
     public static class Options {
         @Option(help = "Inline methods during parsing before the static analysis.")//
-        public static final HostedOptionKey<Boolean> NativeInlineBeforeAnalysis = new HostedOptionKey<>(false);
+        public static final HostedOptionKey<Boolean> InlineBeforeAnalysis = new HostedOptionKey<>(false);
 
     }
 
@@ -82,32 +88,69 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     @Override
     public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
-        // b has info for caller
-        int nodeCountCaller = b.getGraph().getNodeCount();
-        // get graph for callee
-        StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
-        int nodeCountCallee = graph.getNodeCount();
-        // for now, look for method with small number of nodes, one or two
-        if (nodeCountCallee <= 2) {
+
+        if (b.parsingIntrinsic()) {
+            /* We are not interfering with any intrinsic method handling. */
+            return null;
+        }
+
+        if (method.getAnnotation(NeverInline.class) != null || method.getAnnotation(NeverInlineTrivial.class) != null) {
+            return null;
+        }
+
+        if (method.getAnnotation(RestrictHeapAccess.class) != null || method.getAnnotation(Uninterruptible.class) != null ||
+                b.getMethod().getAnnotation(RestrictHeapAccess.class) != null || b.getMethod().getAnnotation(Uninterruptible.class) != null) {
+            /*
+             * Caller or callee have an annotation that might prevent inlining. We don't check the
+             * exact condition but instead always bail out for simplicity.
+             */
+            return null;
+        }
+
+        if (!method.hasBytecodes())
+            return null;
+
+        if (method.isSynchronized())
+          return null;
+
+        if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null)
+            return null;
+
+        if (((AnalysisMethod)method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null)
+            /* Method has a manually constructed graph via GraphProvider. */
+            return null;
+
+        // method is declared in user's class
+        if(SubstrateOptions.Class.getValue().equals(method.format("%H"))) {
+            // b has info for caller
+            int nodeCountCaller = b.getGraph().getNodeCount();
+            // get graph for callee
+            StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
+
+            AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedGraphBuilderPhase.SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes());
+            graphbuilder.apply(graph);
+
+            int nodeCountCallee = graph.getNodeCount();
+
             System.out.println(b.getMethod().format("Caller: %n (class: %H), par: %p, ")
-                    + "node count: " + nodeCountCaller
-                    + method.format("\nCallee: %n (class: %H), par: %p, ")
-                    + "node count: " + nodeCountCallee);
+                        + "node count: " + nodeCountCaller
+                        + method.format("\nCallee: %n (class: %H), par: %p, ")
+                        + "node count: " + nodeCountCallee);
             // first, look for getters, setters and similar methods
-            for(Node node : graph.getNodes()){
-                System.out.println(node.toString());
+            for (Node node : graph.getNodes()) {
+                System.out.print(node.toString());
                 if (node instanceof LoadFieldNode)
-                    System.out.println("Node represents a read of a static or instance field.");
+                    System.out.print(" - node represents a read of a static or instance field.");
                 if (node instanceof StoreFieldNode)
-                    System.out.println("Node represents a write to a static or instance field.");
+                    System.out.print(" - node represents a write to a static or instance field.");
                 if (node instanceof ParameterNode)
-                    System.out.println("Node represents a placeholder for an incoming argument to a function call.");
+                    System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
                 if (node instanceof ConstantNode)
-                    System.out.println("Node represents a constant");
+                    System.out.print(" - node represents a constant");
+                System.out.println();
             }
             System.out.println();
         }
-
         return null;
     }
 
