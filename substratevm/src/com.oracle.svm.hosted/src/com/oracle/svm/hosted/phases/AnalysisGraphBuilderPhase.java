@@ -47,19 +47,20 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 public class AnalysisGraphBuilderPhase extends SharedGraphBuilderPhase {
 
     public AnalysisGraphBuilderPhase(Providers providers,
-                    GraphBuilderConfiguration graphBuilderConfig, OptimisticOptimizations optimisticOpts, IntrinsicContext initialIntrinsicContext, WordTypes wordTypes) {
-        super(providers, graphBuilderConfig, optimisticOpts, initialIntrinsicContext, wordTypes);
+                    GraphBuilderConfiguration graphBuilderConfig, OptimisticOptimizations optimisticOpts, IntrinsicContext initialIntrinsicContext, WordTypes wordTypes,
+                                     NativeImageInlineDuringParsingPlugin.InvocationData inlineInvocationData) {
+        super(providers, graphBuilderConfig, optimisticOpts, initialIntrinsicContext, wordTypes, inlineInvocationData);
     }
 
     @Override
     protected BytecodeParser createBytecodeParser(StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
-        return new AnalysisBytecodeParser(this, graph, parent, method, entryBCI, intrinsicContext);
+        return new AnalysisBytecodeParser(this, graph, parent, method, entryBCI, intrinsicContext, inlineInvocationData);
     }
 
     public static class AnalysisBytecodeParser extends SharedBytecodeParser {
         protected AnalysisBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI,
-                        IntrinsicContext intrinsicContext) {
-            super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, true);
+                        IntrinsicContext intrinsicContext, NativeImageInlineDuringParsingPlugin.InvocationData inlineInvocationData) {
+            super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, true, true, inlineInvocationData);
         }
 
         @Override

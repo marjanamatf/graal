@@ -63,6 +63,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 import static com.oracle.graal.pointsto.infrastructure.GraphProvider.*;
+import static com.oracle.svm.hosted.phases.SharedGraphBuilderPhase.*;
 
 public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin {
 
@@ -73,10 +74,111 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     }
 
+    static final class CallSite {
+        final AnalysisMethod caller;
+        final int bci;
+
+        CallSite(AnalysisMethod caller, int bci) {
+            this.caller = caller;
+            this.bci = bci;
+        }
+
+        @Override
+        public int hashCode() {
+            return caller.hashCode() * 31 + bci;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            } else if (obj == null || getClass() != obj.getClass()) {
+                return false;
+            }
+            CallSite other = (CallSite) obj;
+            return bci == other.bci && caller.equals(other.caller);
+        }
+
+        @Override
+        public String toString() {
+            return caller.format("%h.%n(%p)") + "@" + bci;
+        }
+    }
+
     static class InvocationResult {
         static final InvocationResult ANALYSIS_TOO_COMPLICATED = new InvocationResult();
         static final InvocationResult NO_ANALYSIS = new InvocationResult();
     }
+
+    public static class InvocationResultInline extends InvocationResult {
+        final CallSite site;
+        final AnalysisMethod callee;
+        final Map<CallSite, InvocationResultInline> children;
+
+        public InvocationResultInline(CallSite site, AnalysisMethod callee) {
+            this.site = site;
+            this.callee = callee;
+            this.children = new HashMap<>();
+        }
+
+        @Override
+        public String toString() {
+            return append(new StringBuilder(), "").toString();
+        }
+
+        private StringBuilder append(StringBuilder sb, String indentation) {
+            sb.append(site).append(" -> ").append(callee.format("%h.%n(%p)"));
+            String newIndentation = indentation + "  ";
+            for (InvocationResultInline child : children.values()) {
+                sb.append(System.lineSeparator()).append(newIndentation);
+                child.append(sb, newIndentation);
+            }
+            return sb;
+        }
+    }
+
+    public static class InvocationData {
+        private final ConcurrentMap<AnalysisMethod, ConcurrentMap<Integer, InvocationResult>> data = new ConcurrentHashMap<>();
+
+        private ConcurrentMap<Integer, InvocationResult> bciMap(ResolvedJavaMethod method) {
+            AnalysisMethod key;
+            if (method instanceof AnalysisMethod) {
+                key = (AnalysisMethod) method;
+            } else {
+                key = ((HostedMethod) method).getWrapped();
+            }
+
+            return data.computeIfAbsent(key, unused -> new ConcurrentHashMap<>());
+        }
+
+        InvocationResult get(ResolvedJavaMethod method, int bci) {
+            return bciMap(method).get(bci);
+        }
+
+        InvocationResult putIfAbsent(ResolvedJavaMethod method, int bci, InvocationResult value) {
+            return bciMap(method).putIfAbsent(bci, value);
+        }
+
+        public void onCreateInvoke(GraphBuilderContext b, int invokeBci, boolean analysis, ResolvedJavaMethod callee) {
+            if (b.getDepth() == 0) {
+
+                if (callee != null && callee.equals(b.getMetaAccess().lookupJavaMethod(SubstrateClassInitializationPlugin.ENSURE_INITIALIZED_METHOD))) {
+                    return;
+                }
+
+                ConcurrentMap<Integer, InvocationResult> map = bciMap(b.getMethod());
+                if (analysis) {
+                    map.putIfAbsent(invokeBci, InvocationResult.NO_ANALYSIS);
+                } else {
+                    InvocationResult state = map.get(invokeBci);
+                    if (state != InvocationResult.ANALYSIS_TOO_COMPLICATED && state != InvocationResult.NO_ANALYSIS) {
+                        throw VMError.shouldNotReachHere("Missing information for call site: " + b.getMethod().asStackTraceElement(invokeBci));
+                    }
+                }
+            }
+        }
+    }
+
 
     private final boolean analysis;
     private final HostedProviders providers;
@@ -88,6 +190,10 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     @Override
     public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
+       /* InvocationData data = ((SharedBytecodeParser) b).inlineInvocationData;
+        if (data == null) {
+            throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
+        }*/
 
         if (b.parsingIntrinsic()) {
             /* We are not interfering with any intrinsic method handling. */
@@ -107,50 +213,76 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
             return null;
         }
 
-        if (!method.hasBytecodes())
+        if (method.equals(b.getMetaAccess().lookupJavaMethod(SubstrateClassInitializationPlugin.ENSURE_INITIALIZED_METHOD))) {
             return null;
+        }
 
-        if (method.isSynchronized())
-          return null;
+        CallSite callSite = new CallSite(toAnalysisMethod(b.getMethod()), b.bci());
 
-        if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null)
-            return null;
+        InvocationResult inline;
+        if (b.getDepth() > 0) {
+            /*
+             * We already decided to inline the first callee into the root method, so now
+             * recursively inline everything.
+             */
+            inline = ((SharedBytecodeParser) b.getParent()).inlineDuringParsingState.children.get(callSite);
 
-        if (((AnalysisMethod)method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null)
-            /* Method has a manually constructed graph via GraphProvider. */
-            return null;
+        } else {
+            // analyze method
+            InvocationResult newResult;
 
-        // method is declared in user's class
-        if(SubstrateOptions.Class.getValue().equals(method.format("%H"))) {
-            // b has info for caller
-            int nodeCountCaller = b.getGraph().getNodeCount();
-            // get graph for callee
-            StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
+            if (!method.hasBytecodes()) {
+                /* Native method. */
+                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
 
-            AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedGraphBuilderPhase.SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes());
-            graphbuilder.apply(graph);
+            } else if (method.isSynchronized()) {
+                /*
+                 * Synchronization operations will always bring us above the node limit, so no point in
+                 * starting an analysis.
+                 */
+                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
 
-            int nodeCountCallee = graph.getNodeCount();
+            } else if (((AnalysisMethod) method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null) {
+                /* Method has a manually constructed graph via GraphProvider. */
+                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
 
-            System.out.println(b.getMethod().format("Caller: %n (class: %H), par: %p, ")
+            } else if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null) {
+                /* Method has an invocation plugin that we must not miss. */
+                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+            } else {
+                // build graph for method and analyze
+                // b has info for caller
+                int nodeCountCaller = b.getGraph().getNodeCount();
+                // get graph for callee
+                StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
+
+                AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes(), null);
+                graphbuilder.apply(graph);
+
+                int nodeCountCallee = graph.getNodeCount();
+
+                System.out.println(b.getMethod().format("Caller: %n (class: %H), par: %p, ")
                         + "node count: " + nodeCountCaller
                         + method.format("\nCallee: %n (class: %H), par: %p, ")
                         + "node count: " + nodeCountCallee);
-            // first, look for getters, setters and similar methods
-            for (Node node : graph.getNodes()) {
-                System.out.print(node.toString());
-                if (node instanceof LoadFieldNode)
-                    System.out.print(" - node represents a read of a static or instance field.");
-                if (node instanceof StoreFieldNode)
-                    System.out.print(" - node represents a write to a static or instance field.");
-                if (node instanceof ParameterNode)
-                    System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
-                if (node instanceof ConstantNode)
-                    System.out.print(" - node represents a constant");
-                System.out.println();
+                // first, look for getters, setters and similar methods
+                for (Node node : graph.getNodes()) {
+                    System.out.print(node.toString());
+                    if (node instanceof LoadFieldNode)
+                        System.out.print(" - node represents a read of a static or instance field.");
+                    if (node instanceof StoreFieldNode)
+                        System.out.print(" - node represents a write to a static or instance field.");
+                    if (node instanceof ParameterNode)
+                        System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
+                    if (node instanceof ConstantNode)
+                        System.out.print(" - node represents a constant");
+                    System.out.println();
+
+                    System.out.println();
+                }
             }
-            System.out.println();
         }
+
         return null;
     }
 
@@ -169,10 +301,11 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     }
 
-    class MethodBytecodeParser extends BytecodeParser{
-
-        protected MethodBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
-            super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext);
+    static AnalysisMethod toAnalysisMethod(ResolvedJavaMethod method) {
+        if (method instanceof AnalysisMethod) {
+            return (AnalysisMethod) method;
+        } else {
+            return ((HostedMethod) method).getWrapped();
         }
     }
 }

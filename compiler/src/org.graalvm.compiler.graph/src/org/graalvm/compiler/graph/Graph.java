@@ -651,13 +651,13 @@ public class Graph {
     /**
      * Registers a given {@link NodeEventListener} with this graph. This should be used in
      * conjunction with try-with-resources statement as follows:
-     *
-     * <pre>
+            *
+            * <pre>
      * try (NodeEventScope nes = graph.trackNodeEvents(listener)) {
      *     // make changes to the graph
      * }
      * </pre>
-     */
+            */
     public NodeEventScope trackNodeEvents(NodeEventListener listener) {
         return new NodeEventScope(listener);
     }
