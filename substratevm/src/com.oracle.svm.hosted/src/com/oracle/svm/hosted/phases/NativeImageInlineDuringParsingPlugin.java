@@ -27,6 +27,7 @@ package com.oracle.svm.hosted.phases;
 import com.oracle.graal.pointsto.BigBang;
 import com.oracle.graal.pointsto.infrastructure.GraphProvider;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
+import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.graal.pointsto.util.CompletionExecutor.DebugContextRunnable;
 import com.oracle.svm.core.SubstrateOptions;
@@ -34,6 +35,7 @@ import com.oracle.svm.core.annotate.NeverInline;
 import com.oracle.svm.core.annotate.NeverInlineTrivial;
 import com.oracle.svm.core.annotate.RestrictHeapAccess;
 import com.oracle.svm.core.annotate.Uninterruptible;
+import com.oracle.svm.core.graal.jdk.ArraycopySnippets;
 import com.oracle.svm.core.option.HostedOptionKey;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.meta.HostedMethod;
@@ -55,6 +57,7 @@ import org.graalvm.compiler.nodes.java.StoreFieldNode;
 import org.graalvm.compiler.options.Option;
 import org.graalvm.compiler.options.OptionValues;
 import org.graalvm.compiler.phases.OptimisticOptimizations;
+import org.graalvm.compiler.replacements.Snippets;
 
 import java.util.HashMap;
 import java.util.List;
@@ -190,10 +193,22 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     @Override
     public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
+
+        if (Snippets.class.isAssignableFrom(((AnalysisMethod) (b.getMethod())).getDeclaringClass().getJavaClass())) {
+            /* We are not interfering with any snippet */
+            // System.out.println(((AnalysisMethod) (b.getMethod())).getDeclaringClass().getJavaClass());
+            return null;
+        }
+
+        if (Snippets.class.isAssignableFrom(((AnalysisMethod)method).getDeclaringClass().getJavaClass())) {
+            /* We are not interfering with any snippet */
+            // System.out.println(((AnalysisMethod)method).getDeclaringClass().getJavaClass());
+            return null;
+        }
+
         InvocationData data = ((SharedBytecodeParser) b).inlineInvocationData;
         if (data == null) {
-            return null;
-            //throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
+            throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
         }
 
         if (b.parsingIntrinsic()) {
