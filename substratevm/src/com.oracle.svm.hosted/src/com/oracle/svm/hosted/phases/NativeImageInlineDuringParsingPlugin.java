@@ -190,10 +190,11 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
 
     @Override
     public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
-       /* InvocationData data = ((SharedBytecodeParser) b).inlineInvocationData;
+        InvocationData data = ((SharedBytecodeParser) b).inlineInvocationData;
         if (data == null) {
-            throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
-        }*/
+            return null;
+            //throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
+        }
 
         if (b.parsingIntrinsic()) {
             /* We are not interfering with any intrinsic method handling. */
@@ -228,64 +229,69 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
             inline = ((SharedBytecodeParser) b.getParent()).inlineDuringParsingState.children.get(callSite);
 
         } else {
-            // analyze method
-            InvocationResult newResult;
+            if (analysis) {
+                InvocationResult newResult;
 
-            if (!method.hasBytecodes()) {
-                /* Native method. */
-                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+                if (!method.hasBytecodes()) {
+                    /* Native method. */
+                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+                } else if (method.isSynchronized()) {
+                    /*
+                     * Synchronization operations will always bring us above the node limit, so no point in
+                     * starting an analysis.
+                     */
+                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
 
-            } else if (method.isSynchronized()) {
-                /*
-                 * Synchronization operations will always bring us above the node limit, so no point in
-                 * starting an analysis.
-                 */
-                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+                } else if (((AnalysisMethod) method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null) {
+                    /* Method has a manually constructed graph via GraphProvider. */
+                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
 
-            } else if (((AnalysisMethod) method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null) {
-                /* Method has a manually constructed graph via GraphProvider. */
-                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+                } else if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null) {
+                    /* Method has an invocation plugin that we must not miss. */
+                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+               } else {
 
-            } else if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null) {
-                /* Method has an invocation plugin that we must not miss. */
-                newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
-            } else {
-                // build graph for method and analyze
-                // b has info for caller
-                int nodeCountCaller = b.getGraph().getNodeCount();
-                // get graph for callee
-                StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
+                    // build graph for method and analyze
+                    // b has info for caller
+                    int nodeCountCaller = b.getGraph().getNodeCount();
+                    // get graph for callee
+                    StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
+                    AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes(), null);
+                    graphbuilder.apply(graph);
+                    int nodeCountCallee = graph.getNodeCount();
 
-                AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes(), null);
-                graphbuilder.apply(graph);
+                    System.out.println("\nbuild structured graph: " + b.getMethod().format("Caller: %n (class: %H), par: %p, ")
+                            + "node count: " + nodeCountCaller
+                            + method.format("\nCallee: %n (class: %H), par: %p, ")
+                            + "node count: " + nodeCountCallee);
+                    // only prints nodes, have to decide what is characteristic of simple methods
+                    for (Node node : graph.getNodes()) {
+                        System.out.print(node.toString());
+                        if (node instanceof LoadFieldNode)
+                            System.out.print(" - node represents a read of a static or instance field.");
+                        if (node instanceof StoreFieldNode)
+                            System.out.print(" - node represents a write to a static or instance field.");
+                        if (node instanceof ParameterNode)
+                            System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
+                        if (node instanceof ConstantNode)
+                            System.out.print(" - node represents a constant");
+                        System.out.println(" ");
 
-                int nodeCountCallee = graph.getNodeCount();
-
-                System.out.println(b.getMethod().format("Caller: %n (class: %H), par: %p, ")
-                        + "node count: " + nodeCountCaller
-                        + method.format("\nCallee: %n (class: %H), par: %p, ")
-                        + "node count: " + nodeCountCallee);
-                // first, look for getters, setters and similar methods
-                for (Node node : graph.getNodes()) {
-                    System.out.print(node.toString());
-                    if (node instanceof LoadFieldNode)
-                        System.out.print(" - node represents a read of a static or instance field.");
-                    if (node instanceof StoreFieldNode)
-                        System.out.print(" - node represents a write to a static or instance field.");
-                    if (node instanceof ParameterNode)
-                        System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
-                    if (node instanceof ConstantNode)
-                        System.out.print(" - node represents a constant");
-                    System.out.println();
-
-                    System.out.println();
+                    }
+                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
                 }
+                InvocationResult existingResult = data.putIfAbsent(b.getMethod(), b.bci(), newResult);
+                inline = newResult;
+            } else {
+                InvocationResult existingResult = data.get(b.getMethod(), b.bci());
+                inline = existingResult;
             }
         }
-
-        return null;
+        if (inline instanceof InvocationResultInline)
+            return InlineInfo.createStandardInlineInfo(method);
+        else
+            return null;
     }
-
     @Override
     public void notifyAfterInline(ResolvedJavaMethod methodToInline) {
 
