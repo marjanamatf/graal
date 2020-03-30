@@ -67,13 +67,13 @@ import jdk.vm.ci.meta.ResolvedJavaMethod;
 public class HostedGraphBuilderPhase extends SubstrateGraphBuilderPhase {
 
     public HostedGraphBuilderPhase(Providers providers, GraphBuilderConfiguration graphBuilderConfig, OptimisticOptimizations optimisticOpts, IntrinsicContext initialIntrinsicContext,
-                    WordTypes wordTypes) {
-        super(providers, graphBuilderConfig, optimisticOpts, initialIntrinsicContext, wordTypes);
+                 WordTypes wordTypes, NativeImageInlineDuringParsingPlugin.InvocationData inlineInvocationData) {
+        super(providers, graphBuilderConfig, optimisticOpts, initialIntrinsicContext, wordTypes, inlineInvocationData);
     }
 
     @Override
     protected BytecodeParser createBytecodeParser(StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
-        return new HostedBytecodeParser(this, graph, parent, method, entryBCI, intrinsicContext);
+        return new HostedBytecodeParser(this, graph, parent, method, entryBCI, intrinsicContext, inlineInvocationData);
     }
 }
 
@@ -84,8 +84,9 @@ class HostedBytecodeParser extends SubstrateBytecodeParser {
     private int currentDeoptIndex;
     private Map<Long, DeoptProxyAnchorNode> deoptEntries = new HashMap<>();
 
-    HostedBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
-        super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, true);
+    HostedBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext,
+                         NativeImageInlineDuringParsingPlugin.InvocationData inlineInvocationData) {
+        super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, true, inlineInvocationData);
     }
 
     @Override
