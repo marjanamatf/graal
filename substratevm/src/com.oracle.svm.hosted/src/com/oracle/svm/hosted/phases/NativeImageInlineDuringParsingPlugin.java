@@ -25,39 +25,61 @@
 package com.oracle.svm.hosted.phases;
 
 import com.oracle.graal.pointsto.BigBang;
-import com.oracle.graal.pointsto.infrastructure.GraphProvider;
 import com.oracle.graal.pointsto.meta.AnalysisMethod;
 import com.oracle.graal.pointsto.meta.AnalysisType;
 import com.oracle.graal.pointsto.meta.HostedProviders;
 import com.oracle.graal.pointsto.util.CompletionExecutor.DebugContextRunnable;
-import com.oracle.svm.core.SubstrateOptions;
 import com.oracle.svm.core.annotate.NeverInline;
 import com.oracle.svm.core.annotate.NeverInlineTrivial;
 import com.oracle.svm.core.annotate.RestrictHeapAccess;
 import com.oracle.svm.core.annotate.Uninterruptible;
-import com.oracle.svm.core.graal.jdk.ArraycopySnippets;
 import com.oracle.svm.core.option.HostedOptionKey;
 import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.meta.HostedMethod;
 import com.oracle.svm.hosted.phases.AnalysisGraphBuilderPhase.AnalysisBytecodeParser;
+import com.oracle.svm.hosted.phases.NativeImageInlineDuringParsingPlugin.CallSite;
+import com.oracle.svm.hosted.phases.NativeImageInlineDuringParsingPlugin.InvocationResult;
+import com.oracle.svm.hosted.phases.NativeImageInlineDuringParsingPlugin.InvocationResultInline;
+import jdk.vm.ci.code.BailoutException;
 import jdk.vm.ci.meta.ResolvedJavaMethod;
+import org.graalvm.compiler.core.common.type.Stamp;
+import org.graalvm.compiler.core.common.type.StampPair;
 import org.graalvm.compiler.debug.DebugContext;
 import org.graalvm.compiler.debug.DebugHandlersFactory;
+import org.graalvm.compiler.graph.Graph.NodeEventListener;
+import org.graalvm.compiler.graph.Graph.NodeEventScope;
 import org.graalvm.compiler.graph.Node;
 import org.graalvm.compiler.java.BytecodeParser;
+import org.graalvm.compiler.java.BytecodeParserOptions;
 import org.graalvm.compiler.java.GraphBuilderPhase;
-import org.graalvm.compiler.nodes.*;
-import org.graalvm.compiler.nodes.cfg.ControlFlowGraph;
+import org.graalvm.compiler.nodes.CallTargetNode;
+import org.graalvm.compiler.nodes.ConstantNode;
+import org.graalvm.compiler.nodes.FrameState;
+import org.graalvm.compiler.nodes.Invoke;
+import org.graalvm.compiler.nodes.InvokeNode;
+import org.graalvm.compiler.nodes.NodeView;
+import org.graalvm.compiler.nodes.ParameterNode;
+import org.graalvm.compiler.nodes.ReturnNode;
+import org.graalvm.compiler.nodes.StructuredGraph;
+import org.graalvm.compiler.nodes.ValueNode;
+import org.graalvm.compiler.nodes.calc.FloatingNode;
 import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderConfiguration;
 import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderContext;
+import org.graalvm.compiler.nodes.graphbuilderconf.GraphBuilderTool;
 import org.graalvm.compiler.nodes.graphbuilderconf.InlineInvokePlugin;
 import org.graalvm.compiler.nodes.graphbuilderconf.IntrinsicContext;
+import org.graalvm.compiler.nodes.graphbuilderconf.ParameterPlugin;
 import org.graalvm.compiler.nodes.java.LoadFieldNode;
+import org.graalvm.compiler.nodes.java.NewArrayNode;
+import org.graalvm.compiler.nodes.java.NewInstanceNode;
 import org.graalvm.compiler.nodes.java.StoreFieldNode;
+import org.graalvm.compiler.nodes.spi.UncheckedInterfaceProvider;
+import org.graalvm.compiler.nodes.type.StampTool;
 import org.graalvm.compiler.options.Option;
 import org.graalvm.compiler.options.OptionValues;
 import org.graalvm.compiler.phases.OptimisticOptimizations;
-import org.graalvm.compiler.replacements.Snippets;
+import org.graalvm.compiler.phases.util.Providers;
+import org.graalvm.compiler.word.WordTypes;
 
 import java.util.HashMap;
 import java.util.List;
@@ -65,8 +87,8 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
-import static com.oracle.graal.pointsto.infrastructure.GraphProvider.*;
-import static com.oracle.svm.hosted.phases.SharedGraphBuilderPhase.*;
+import static com.oracle.graal.pointsto.infrastructure.GraphProvider.Purpose;
+import static com.oracle.svm.hosted.phases.SharedGraphBuilderPhase.SharedBytecodeParser;
 
 public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin {
 
@@ -194,18 +216,6 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
     @Override
     public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
 
-        if (Snippets.class.isAssignableFrom(((AnalysisMethod) (b.getMethod())).getDeclaringClass().getJavaClass())) {
-            /* We are not interfering with any snippet */
-            // System.out.println(((AnalysisMethod) (b.getMethod())).getDeclaringClass().getJavaClass());
-            return null;
-        }
-
-        if (Snippets.class.isAssignableFrom(((AnalysisMethod)method).getDeclaringClass().getJavaClass())) {
-            /* We are not interfering with any snippet */
-            // System.out.println(((AnalysisMethod)method).getDeclaringClass().getJavaClass());
-            return null;
-        }
-
         InvocationData data = ((SharedBytecodeParser) b).inlineInvocationData;
         if (data == null) {
             throw VMError.shouldNotReachHere("must not use SubstrateInlineDuringParsingPlugin when bytecode parser does not have InvocationData");
@@ -244,82 +254,98 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
             inline = ((SharedBytecodeParser) b.getParent()).inlineDuringParsingState.children.get(callSite);
 
         } else {
+
             if (analysis) {
+                BigBang bb = ((AnalysisBytecodeParser) b).bb;
                 InvocationResult newResult;
+// if (b.getMethod().format("%H").contains("InlineDuringParsingTests")) {
+                TrivialMethodDetector detector = new TrivialMethodDetector(bb, providers, ((SharedBytecodeParser) b).getGraphBuilderConfig(), b.getOptions(), b.getDebug());
+                newResult = detector.analyzeMethod(callSite, (AnalysisMethod) method, args, null);
 
-                if (!method.hasBytecodes()) {
-                    /* Native method. */
-                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
-                } else if (method.isSynchronized()) {
-                    /*
-                     * Synchronization operations will always bring us above the node limit, so no point in
-                     * starting an analysis.
-                     */
-                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+// if (newResult instanceof InvocationResultInline) {
+// System.out.println("Created: " + newResult);
+// }
 
-                } else if (((AnalysisMethod) method).buildGraph(b.getDebug(), method, providers, Purpose.ANALYSIS) != null) {
-                    /* Method has a manually constructed graph via GraphProvider. */
-                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+// } else {
+// newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
+// }
 
-                } else if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null) {
-                    /* Method has an invocation plugin that we must not miss. */
-                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
-               } else {
-
-                    // build graph for method and analyze
-                    // b has info for caller
-                    int nodeCountCaller = b.getGraph().getNodeCount();
-                    // get graph for callee
-                    StructuredGraph graph = new StructuredGraph.Builder(b.getOptions(), b.getDebug()).method(method).build();
-                    AnalysisGraphBuilderPhase graphbuilder = new AnalysisGraphBuilderPhase(providers, ((SharedBytecodeParser) b).getGraphBuilderConfig(), OptimisticOptimizations.NONE, null, providers.getWordTypes(), null);
-                    graphbuilder.apply(graph);
-                    int nodeCountCallee = graph.getNodeCount();
-
-                    System.out.println("\nbuild structured graph: " + b.getMethod().format("Caller: %n (class: %H), par: %p, ")
-                            + "node count: " + nodeCountCaller
-                            + method.format("\nCallee: %n (class: %H), par: %p, ")
-                            + "node count: " + nodeCountCallee);
-                    // only prints nodes, have to decide what is characteristic of simple methods
-                    for (Node node : graph.getNodes()) {
-                        System.out.print(node.toString());
-                        if (node instanceof LoadFieldNode)
-                            System.out.print(" - node represents a read of a static or instance field.");
-                        if (node instanceof StoreFieldNode)
-                            System.out.print(" - node represents a write to a static or instance field.");
-                        if (node instanceof ParameterNode)
-                            System.out.print(" - node represents a placeholder for an incoming argument to a function call.");
-                        if (node instanceof ConstantNode)
-                            System.out.print(" - node represents a constant");
-                        System.out.println(" ");
-
-                    }
-                    newResult = InvocationResult.ANALYSIS_TOO_COMPLICATED;
-                }
                 InvocationResult existingResult = data.putIfAbsent(b.getMethod(), b.bci(), newResult);
+                if (existingResult != null) {
+                    throw VMError.shouldNotReachHere("Analysis result already present: " + b.getMethod().asStackTraceElement(b.bci()));
+                }
                 inline = newResult;
             } else {
                 InvocationResult existingResult = data.get(b.getMethod(), b.bci());
+                if (existingResult == null) {
+                    throw VMError.shouldNotReachHere("No analysis result present: " + b.getMethod().asStackTraceElement(b.bci()));
+                }
                 inline = existingResult;
+
+// if (inline instanceof InvocationResultInline) {
+// System.out.println("Using: " + inline);
+// }
+
             }
         }
-        if (inline instanceof InvocationResultInline)
+
+        if (inline instanceof InvocationResultInline) {
+            InvocationResultInline inlineData = (InvocationResultInline) inline;
+            VMError.guarantee(inlineData.callee == toAnalysisMethod(method));
+
+            VMError.guarantee(((SharedBytecodeParser) b).inlineDuringParsingState == null);
+            ((SharedBytecodeParser) b).inlineDuringParsingState = inlineData;
+
+            if (analysis) {
+                AnalysisMethod aMethod = (AnalysisMethod) method;
+                aMethod.registerAsImplementationInvoked(null);
+
+                ensureParsed(((AnalysisBytecodeParser) b).bb, aMethod);
+
+                if (!aMethod.isStatic() && args[0].isConstant()) {
+                    AnalysisType receiverType = (AnalysisType) StampTool.typeOrNull(args[0]);
+                    receiverType.registerAsInHeap();
+                }
+            }
             return InlineInfo.createStandardInlineInfo(method);
-        else
+        } else {
             return null;
-    }
-    @Override
-    public void notifyAfterInline(ResolvedJavaMethod methodToInline) {
-
+        }
     }
 
+    private static void ensureParsed(BigBang bb, AnalysisMethod method) {
+        bb.postTask(new DebugContextRunnable() {
+            @Override
+            public void run(DebugContext ignore) {
+                method.getTypeFlow().ensureParsed(bb, null);
+            }
+
+            @Override
+            public DebugContext getDebug(OptionValues options, List<DebugHandlersFactory> factories) {
+                return DebugContext.disabled(options);
+            }
+        });
+    }
+
+
     @Override
-    public void notifyBeforeInline(ResolvedJavaMethod methodToInline) {
+    public void notifyBeforeInline(GraphBuilderContext b, ResolvedJavaMethod methodToInline) {
+        SharedBytecodeParser parser = (SharedBytecodeParser) b;
+        InvocationResultInline inlineData = parser.inlineDuringParsingState;
+        if (inlineData != null) {
+            VMError.guarantee(inlineData.callee == toAnalysisMethod(methodToInline));
+        }
 
     }
 
     @Override
-    public void notifyNotInlined(GraphBuilderContext b, ResolvedJavaMethod method, Invoke invoke) {
-
+    public void notifyAfterInline(GraphBuilderContext b, ResolvedJavaMethod methodToInline) {
+        SharedBytecodeParser parser = (SharedBytecodeParser) b;
+        InvocationResultInline inlineData = parser.inlineDuringParsingState;
+        if (inlineData != null) {
+            VMError.guarantee(inlineData.callee == toAnalysisMethod(methodToInline));
+            parser.inlineDuringParsingState = null;
+        }
     }
 
     static AnalysisMethod toAnalysisMethod(ResolvedJavaMethod method) {
@@ -327,6 +353,238 @@ public class NativeImageInlineDuringParsingPlugin implements InlineInvokePlugin 
             return (AnalysisMethod) method;
         } else {
             return ((HostedMethod) method).getWrapped();
+        }
+    }
+
+}
+
+class TrivialMethodDetector {
+
+    final BigBang bb;
+    final HostedProviders providers;
+    final GraphBuilderConfiguration prototypeGraphBuilderConfig;
+    final OptionValues options;
+    final DebugContext debug;
+
+    TrivialMethodDetector(BigBang bb, HostedProviders providers, GraphBuilderConfiguration originalGraphBuilderConfig, OptionValues options, DebugContext debug) {
+        this.bb = bb;
+        this.debug = debug;
+        this.prototypeGraphBuilderConfig = makePrototypeGraphBuilderConfig(originalGraphBuilderConfig);
+        this.options = options;
+        this.providers = providers;
+    }
+
+    private static GraphBuilderConfiguration makePrototypeGraphBuilderConfig(GraphBuilderConfiguration originalGraphBuilderConfig) {
+        GraphBuilderConfiguration result = originalGraphBuilderConfig.copy();
+
+        result.getPlugins().clearParameterPlugin();
+
+        result.getPlugins().clearInlineInvokePlugins();
+        for (InlineInvokePlugin inlineInvokePlugin : originalGraphBuilderConfig.getPlugins().getInlineInvokePlugins()) {
+            if (!(inlineInvokePlugin instanceof NativeImageInlineDuringParsingPlugin)) {
+                result.getPlugins().appendInlineInvokePlugin(inlineInvokePlugin);
+            }
+        }
+
+        return result;
+    }
+
+    @SuppressWarnings("try")
+    InvocationResult analyzeMethod(CallSite callSite, AnalysisMethod method, ValueNode[] args, Object existingSingleAllowedElement) {
+
+        if (!method.hasBytecodes()) {
+            /* Native method. */
+            return InvocationResult.ANALYSIS_TOO_COMPLICATED;
+
+        } else if (method.isSynchronized()) {
+            /*
+             * Synchronization operations will always bring us above the node limit, so no point in
+             * starting an analysis.
+             */
+            return InvocationResult.ANALYSIS_TOO_COMPLICATED;
+
+        } else if (method.buildGraph(debug, method, providers, Purpose.ANALYSIS) != null) {
+            /* Method has a manually constructed graph via GraphProvider. */
+            return InvocationResult.ANALYSIS_TOO_COMPLICATED;
+
+        } else if (providers.getGraphBuilderPlugins().getInvocationPlugins().lookupInvocation(method) != null) {
+            /* Method has an invocation plugin that we must not miss. */
+            return InvocationResult.ANALYSIS_TOO_COMPLICATED;
+        }
+
+        MethodState methodState = new MethodState(new NativeImageInlineDuringParsingPlugin.InvocationResultInline(callSite, method), existingSingleAllowedElement);
+
+        GraphBuilderConfiguration graphBuilderConfig = prototypeGraphBuilderConfig.copy();
+        graphBuilderConfig.getPlugins().appendInlineInvokePlugin(methodState);
+        graphBuilderConfig.getPlugins().appendParameterPlugin(new TrivialMethodDetectorParameterPlugin(args));
+
+        StructuredGraph graph = new StructuredGraph.Builder(options, debug).method(method).build();
+
+        try (DebugContext.Scope s = debug.scope("InlineDuringParsingAnalysis", graph, method, this)) {
+
+            TrivialMethodDetectorGraphBuilderPhase builderPhase = new TrivialMethodDetectorGraphBuilderPhase(bb, providers, graphBuilderConfig, OptimisticOptimizations.NONE, null,
+                    providers.getWordTypes());
+
+            try (NodeEventScope nes = graph.trackNodeEvents(methodState)) {
+                builderPhase.apply(graph);
+            }
+
+            debug.dump(1, graph, "InlineDuringParsingAnalysis successful");
+            return methodState.result;
+
+        } catch (Throwable ex) {
+            debug.dump(1, graph, "InlineDuringParsingAnalysis failed with " + ex.toString());
+
+            /*
+             * Whatever happens during the analysis is non-fatal because we can just not inline that
+             * invocation.
+             */
+            return InvocationResult.ANALYSIS_TOO_COMPLICATED;
+        }
+    }
+
+    class MethodState extends NodeEventListener implements InlineInvokePlugin {
+        final NativeImageInlineDuringParsingPlugin.InvocationResultInline result;
+
+        Object singleAllowedElement;
+
+        MethodState(InvocationResultInline result, Object existingSingleAllowedElement) {
+            this.result = result;
+            this.singleAllowedElement = existingSingleAllowedElement;
+        }
+
+        @Override
+        public void nodeAdded(Node node) {
+            if (node instanceof ConstantNode) {
+                /* Nothing to do, an unlimited amount of constants is allowed. We like constants. */
+            } else if (node instanceof FrameState) {
+                /* Nothing to do. */
+            } else if (node instanceof ParameterNode) {
+                /* Nothing to do. */
+            } else if (node instanceof ReturnNode) {
+                /*
+                 * Nothing to do, returning a value is fine. We don't allow control flow so there
+                 * can never be more than one return.
+                 */
+            } else if (node instanceof InvokeNode || node instanceof LoadFieldNode || node instanceof StoreFieldNode || node instanceof NewInstanceNode || node instanceof NewArrayNode) {
+                if (singleAllowedElement != null) {
+                    System.out.println("Only a single element is allowed: new node " + node + ", existing element " + singleAllowedElement);
+                }
+                singleAllowedElement = node;
+
+            } else if (node instanceof CallTargetNode) {
+                /* Nothing to do. */
+
+            } else {
+                System.out.println("Node not allowed: " + node);
+            }
+        }
+
+        @Override
+        public InlineInfo shouldInlineInvoke(GraphBuilderContext b, ResolvedJavaMethod method, ValueNode[] args) {
+            if (method.getAnnotation(NeverInline.class) != null || method.getAnnotation(NeverInlineTrivial.class) != null) {
+                return null;
+            }
+            if (b.getDepth() > BytecodeParserOptions.InlineDuringParsingMaxDepth.getValue(b.getOptions())) {
+                return null;
+            }
+
+// if (singleAllowedElement != null) {
+// throw new TrivialMethodDetectorBailoutException("Only a single element is allowed: new invoke of
+// " + method + ", existing element " + singleAllowedElement);
+// }
+
+            InvocationResult state = analyzeMethod(new CallSite((AnalysisMethod) b.getMethod(), b.bci()), (AnalysisMethod) method, args, singleAllowedElement);
+
+            if (state instanceof InvocationResultInline) {
+
+                if (b.getDepth() == 0) {
+                    InvocationResultInline inlineState = (InvocationResultInline) state;
+                    if (result.children.containsKey(inlineState.site)) {
+                        throw new TrivialMethodDetectorBailoutException("Invoke already registered: " + inlineState.site);
+                    }
+                    result.children.put(inlineState.site, inlineState);
+                }
+
+                // singleAllowedElement = method;
+                return InlineInfo.createStandardInlineInfo(method);
+            } else {
+                return null;
+            }
+        }
+    }
+
+}
+
+class TrivialMethodDetectorBailoutException extends BailoutException {
+
+    private static final long serialVersionUID = -1063600090362390263L;
+
+    TrivialMethodDetectorBailoutException(String message) {
+        super(message);
+    }
+
+    /**
+     * For performance reasons, this exception does not record any stack trace information.
+     */
+    @SuppressWarnings("sync-override")
+    @Override
+    public final Throwable fillInStackTrace() {
+        return this;
+    }
+}
+
+class TrivialMethodDetectorGraphBuilderPhase extends AnalysisGraphBuilderPhase {
+
+    TrivialMethodDetectorGraphBuilderPhase(BigBang bb, Providers providers,
+                                           GraphBuilderConfiguration graphBuilderConfig, OptimisticOptimizations optimisticOpts, IntrinsicContext initialIntrinsicContext, WordTypes wordTypes) {
+        super(bb, providers, graphBuilderConfig, optimisticOpts, initialIntrinsicContext, wordTypes, null);
+    }
+
+    @Override
+    protected BytecodeParser createBytecodeParser(StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI, IntrinsicContext intrinsicContext) {
+        return new TrivialMethodDetectorBytecodeParser(bb, this, graph, parent, method, entryBCI, intrinsicContext);
+    }
+
+}
+
+class TrivialMethodDetectorBytecodeParser extends AnalysisBytecodeParser {
+    protected TrivialMethodDetectorBytecodeParser(BigBang bb, GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI,
+                                                  IntrinsicContext intrinsicContext) {
+        super(bb, graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext, null);
+    }
+
+    @Override
+    protected boolean needsExplicitNullCheckException(ValueNode object) {
+        if (currentBlock.exceptionDispatchBlock() != null) {
+            throw new TrivialMethodDetectorBailoutException("Null check inside exception handler");
+        }
+        return false;
+    }
+}
+
+class TrivialMethodDetectorParameterPlugin implements ParameterPlugin {
+
+    private final ValueNode[] args;
+
+    TrivialMethodDetectorParameterPlugin(ValueNode[] args) {
+        this.args = args;
+    }
+
+    @Override
+    public FloatingNode interceptParameter(GraphBuilderTool b, int index, StampPair stamp) {
+        ValueNode arg = args[index];
+        Stamp argStamp = arg.stamp(NodeView.DEFAULT);
+        if (arg.isConstant()) {
+            return new ConstantNode(arg.asConstant(), argStamp);
+        } else {
+            StampPair stampPair;
+            if (arg instanceof UncheckedInterfaceProvider) {
+                stampPair = StampPair.create(argStamp, ((UncheckedInterfaceProvider) arg).uncheckedStamp());
+            } else {
+                stampPair = StampPair.createSingle(argStamp);
+            }
+            return new ParameterNode(index, stampPair);
         }
     }
 }

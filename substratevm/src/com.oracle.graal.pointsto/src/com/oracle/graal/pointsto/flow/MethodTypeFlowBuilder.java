@@ -218,7 +218,7 @@ public class MethodTypeFlowBuilder {
                          */
                         config = config.withRetainLocalVariables(true);
 
-                        bb.getHostVM().createGraphBuilderPhase(bb.getProviders(), config, OptimisticOptimizations.NONE, null).apply(graph);
+                        bb.getHostVM().createGraphBuilderPhase(bb, bb.getProviders(), config, OptimisticOptimizations.NONE, null).apply(graph);
                     }
                 } catch (PermanentBailoutException ex) {
                     bb.getUnsupportedFeatures().addMessage(method.format("%H.%n(%p)"), method, ex.getLocalizedMessage(), null, ex);

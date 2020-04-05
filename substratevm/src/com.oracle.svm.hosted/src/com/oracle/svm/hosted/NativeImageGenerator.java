@@ -1117,7 +1117,7 @@ public class NativeImageGenerator {
         plugins.appendInlineInvokePlugin(replacements);
 
         // if analysis is false, don't add plugin
-        if (analysis && NativeImageInlineDuringParsingPlugin.Options.InlineBeforeAnalysis.getValue()) {
+        if ( NativeImageInlineDuringParsingPlugin.Options.InlineBeforeAnalysis.getValue()) {
             System.out.println("Point to add NativeImageInlineDuringParsingPlugin");
             plugins.appendInlineInvokePlugin(new NativeImageInlineDuringParsingPlugin(analysis, providers));
             System.out.println("NativeImageInlineDuringParsingPlugin added");
