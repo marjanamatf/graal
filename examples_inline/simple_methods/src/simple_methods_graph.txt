@@ -1,0 +1,42 @@
+Simple methods and nodes in theirs structured graph
+
+---------------------------------------------------------------------
+-- example: method returns a constant
+
+    public static int two(){ return 2; }
+
+-- build structured graph: 
+Caller: main (class: SimpleMethods), par: String[], node count: 27
+Callee: two (class: SimpleMethods), par: , node count: 4
+0|StartNode 
+1|FrameState@0 
+2|Constant(2, i32) - node represents a constant 
+3|Return 
+
+---------------------------------------------------------------------
+-- example: method returns the value of a static field
+
+    public static int getNumber(){ return number; }
+
+-- build structured graph: Caller: main (class: SimpleMethods), par: String[], node count: 33
+Callee: getNumber (class: SimpleMethods), par: , node count: 4
+0|StartNode 
+1|FrameState@0 
+2|LoadField#number - node represents a read of a static or instance field. 
+3|Return 
+
+---------------------------------------------------------------------
+-- example: method returns the value of a private instance field
+
+    public int getX() { return x; }
+
+-- build structured graph: Caller: main (class: SimpleMethods), par: String[], node count: 24
+Callee: getX (class: SimpleMethods), par: , node count: 5
+0|StartNode 
+1|Parameter(0) - node represents a placeholder for an incoming argument to a function call. 
+2|FrameState@0 
+3|LoadField#x - node represents a read of a static or instance field. 
+4|Return 
+
+---------------------------------------------------------------------
+
