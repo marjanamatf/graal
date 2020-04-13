@@ -50,6 +50,7 @@ import com.oracle.svm.core.util.VMError;
 import com.oracle.svm.hosted.ExceptionSynthesizer;
 import com.oracle.svm.hosted.HostedConfiguration;
 import com.oracle.svm.hosted.NativeImageOptions;
+import com.oracle.svm.hosted.phases.NativeImageInlineDuringParsingPlugin;
 
 import jdk.vm.ci.meta.JavaConstant;
 import jdk.vm.ci.meta.JavaField;
@@ -73,6 +74,7 @@ public abstract class SharedGraphBuilderPhase extends GraphBuilderPhase.Instance
 
         private final boolean explicitExceptionEdges;
         private final boolean allowIncompleteClassPath;
+        protected NativeImageInlineDuringParsingPlugin.InvocationResultInline inlineDuringParsingState;
 
         protected SharedBytecodeParser(GraphBuilderPhase.Instance graphBuilderInstance, StructuredGraph graph, BytecodeParser parent, ResolvedJavaMethod method, int entryBCI,
                         IntrinsicContext intrinsicContext, boolean explicitExceptionEdges) {
@@ -84,6 +86,10 @@ public abstract class SharedGraphBuilderPhase extends GraphBuilderPhase.Instance
             super(graphBuilderInstance, graph, parent, method, entryBCI, intrinsicContext);
             this.explicitExceptionEdges = explicitExceptionEdges;
             this.allowIncompleteClassPath = allowIncompleteClasspath;
+        }
+
+        public GraphBuilderConfiguration getGraphBuilderConfig() {
+            return graphBuilderConfig;
         }
 
         @Override
